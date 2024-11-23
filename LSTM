@@ -1,0 +1,240 @@
+import os
+from vmdpy import VMD
+import pandas as pd
+from trans import trans_list, array_to_list, imf_composition_trans, trans_type, lstm_tar, tensor_to_list
+from metric import multi_lstm_error, multi_prediction_error
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
+import datetime
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
+all_mae, all_rmse, all_nrmse = [], [], []
+
+alpha = 5         # moderate bandwidth constraint
+tau = 1e-5        # noise-tolerance (no strict fidelity enforcement)
+K = 8              # 8 modes
+DC = 0             # no DC part imposed
+init = 1           # initialize omegas uniformly
+tol = 1e-4
+
+data_minute = pd.read_csv('河南唐河8447.csv')
+# data_minute = pd.read_csv('河南唐河8456.csv', header=None)
+# data_minute = pd.read_csv('河南唐河8482.csv')
+
+speed_site = 4
+
+
+num = len(data_minute.iloc[:, 0])
+hour_num = 2000
+
+data_minute_list = trans_list(data_minute.iloc[:, speed_site])
+data_minute_list = trans_type(data_minute_list)
+
+data_hour_med = []
+for i in range(len(data_minute)):
+    if i % 6 == 0:
+        data_hour_med.append(data_minute.iloc[i, speed_site])
+
+data_hour_list = data_hour_med[:hour_num]
+data_hour_list = trans_type(data_hour_list)
+
+
+vmd_minute, _, _ = VMD(data_minute_list, alpha, tau, K, DC, init, tol)
+vmd_minute = array_to_list(vmd_minute)
+
+
+vmd_hour, _, _ = VMD(data_hour_list, alpha, tau, K, DC, init, tol)
+vmd_hour = array_to_list(vmd_hour)
+
+# 训练集与测试集
+splite = 0.8
+input_size = 1
+deep = 12
+batch_size = 64
+
+train_len = int(splite*(num-input_size-deep+1))
+test_len = num - input_size - train_len - deep + 1
+
+train_len_hour = int(splite*(hour_num-input_size-deep+1))
+test_len_hour = hour_num - input_size - train_len_hour - deep + 1
+
+all_minute_fea = imf_composition_trans([data_minute_list], deep)
+all_hour_fea = imf_composition_trans([data_hour_list], deep)
+
+vmd_minute_fea = imf_composition_trans(vmd_minute, deep)
+vmd_hour_fea = imf_composition_trans(vmd_hour, deep)
+
+
+all_minute_tar_train, all_minute_tar_test = lstm_tar(data_minute_list, input_size, deep, splite)
+all_hour_tar_train, all_hour_tar_test = lstm_tar(data_hour_list, input_size, deep, splite)
+
+train_tar = all_hour_tar_train
+test_tar_origin = all_hour_tar_test
+
+train_len = len(train_tar)
+# test_len = len(test_tar)
+
+fea = vmd_hour_fea
+train_fea = fea[:train_len]
+test_fea = fea[train_len:]
+
+train_data = TensorDataset(torch.Tensor(train_fea), torch.Tensor(train_tar))
+test_data = TensorDataset(torch.Tensor(test_fea), torch.Tensor(test_tar_origin))
+
+train_batch = DataLoader(train_data, batch_size=batch_size)
+test_batch = DataLoader(test_data, batch_size=batch_size)
+
+
+# 网络设置
+
+
+class LSTM(nn.Module):
+
+    def __init__(self):
+        super(LSTM, self).__init__()
+
+        self.Lstm = nn.LSTM(input_size=8, hidden_size=50, batch_first=True, bidirectional=False, num_layers=4,
+                            bias=True)
+        self.linear = nn.Linear(in_features=50, out_features=12, bias=True)
+
+    def forward(self, x):
+        hidden, (_, _) = self.Lstm(x)
+        output = self.linear(hidden)
+        output = output.squeeze(-1)
+
+        return output
+
+
+
+learning_rate = 1e-3
+epoches = 100
+
+loss_func = nn.MSELoss()
+for ac in range(30):
+    np.random.seed(ac+1)
+    torch.manual_seed(ac+1)
+
+    lstm = LSTM().cuda()
+
+    optimizer = torch.optim.Adam(lstm.parameters(), lr=learning_rate, weight_decay=0)
+
+    date_1 = datetime.datetime.now()
+    # 初始化误差
+    train_loss = []
+    train_loss_real = []
+    test_loss = []
+    test_loss_real = []
+    min_test_mse = np.inf
+    test_pred = []
+    train_corr = []
+    test_corr = []
+    train_mae = []
+    test_mae = []
+    best_pred = None
+    for epoch in range(epoches):
+        print('正在进行第{}个epoch'.format(epoch))
+        total_train_loss = []
+        test_pred_case = []
+        train_pred_real = []
+        test_pred_real = []
+        for step, data in enumerate(train_batch):
+            train_fea, train_tar = data
+            train_fea = train_fea.cuda()
+            out = lstm(train_fea)
+            train_y1 = train_tar.cuda()
+            loss = loss_func(out, train_y1)
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            train_pred_real.append(tensor_to_list(out))
+            total_train_loss.append(loss.item())
+        train_loss.append(np.mean(total_train_loss))
+        # train_mae, train_rmse, train_nrmse = multi_prediction_error(train_tar, train_pred_real)
+
+        total_test_loss = []
+        for step, data in enumerate(test_batch):
+            test_fea, test_tar = data
+            test_fea = test_fea.cuda()
+            test = lstm(test_fea)
+            test_pred_case.append(test)
+            test_y1 = test_tar.cuda()
+            los_mse = loss_func(test, test_y1)
+            total_test_loss.append(los_mse.item())
+        test_loss.append(np.mean(total_test_loss))
+        test_pred.append(test_pred_case)
+        # test_mae, test_rmse, test_nrmse = multi_prediction_error(test_tar, test_pred_case)
+        if (test_loss[-1] < min_test_mse):
+
+            best_result = []
+            best_pred = test_pred[-1]
+            min_test_mse = test_loss[-1]
+            # best_result.append([np.mean(test_mae), np.mean(test_rmse), np.mean(test_nrmse)])
+
+            # 编写日志
+        lr = optimizer.param_groups[0]['lr']
+
+        log_string = ('iter: [{:d}/{:d}],'
+                      ' best_test_mse: {:0.8f}, lr: {:0.9f},  '
+                      'train_mse: {:0.8f}, test_mse: {:0.8f}, '
+                      ).format((epoch + 1),
+                               epoches,
+                               min_test_mse,
+                               lr,
+                               train_loss[-1], test_loss[-1],
+                               )
+
+        print(str(datetime.datetime.now()))
+        print(log_string)
+    date_2 = datetime.datetime.now()
+    # pd.DataFrame(best_pred).to_csv('cnn_lstm_8456.csv', index=False)
+
+    print((date_2-date_1).total_seconds())
+
+    final_pre = []
+    final_tar = np.array(test_tar_origin).transpose()
+    for i in range(len(best_pred[0][0])):
+        pre_med = []
+        tar_med = []
+        for j in range(len(best_pred)):
+            for k in range(len(best_pred[j])):
+                pre_med.append(best_pred[j][k][i].item())
+        final_pre.append(pre_med)
+
+    mae_list, rmse_list, nrmse_list = multi_prediction_error(final_tar, final_pre)
+
+    print('-----------------------')
+
+    for i in range(len(mae_list)):
+        print(mae_list[i])
+    print('----------------------')
+    for i in range(len(rmse_list)):
+        print(rmse_list[i])
+    print('----------------------')
+    for i in range(len((nrmse_list))):
+        print(nrmse_list[i]*100)
+    all_mae.append(np.mean(mae_list))
+    all_rmse.append(np.mean(rmse_list))
+    all_nrmse.append(np.mean(np.array(nrmse_list) * 100))
+
+mae_max, rmse_max, nrmse_max = np.max(all_mae), np.max(all_rmse), np.max(all_nrmse)
+mae_min, rmse_min, nrmse_min = np.min(all_mae), np.min(all_rmse), np.min(all_nrmse)
+mae_mean, rmse_mean, nrmse_mean = np.mean(all_mae), np.mean(all_rmse), np.mean(all_nrmse)
+mae_median, rmse_median, nrmse_median = np.median(all_mae), np.median(all_rmse), np.median(all_nrmse)
+mae_std, rmse_std, nrmse_std = np.std(all_mae), np.std(all_rmse), np.std(all_nrmse)
+
+print('---------------Max----------------')
+print(mae_max, rmse_max, nrmse_max)
+
+print('---------------Min----------------')
+print(mae_min, rmse_min, nrmse_min)
+
+print('---------------Mean----------------')
+print(mae_mean, rmse_mean, nrmse_mean)
+
+print('---------------Median----------------')
+print(mae_median, rmse_median, nrmse_median)
+
+print('---------------Std----------------')
+print(mae_std, rmse_std, nrmse_std)
