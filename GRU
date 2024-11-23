@@ -19,18 +19,11 @@ DC = 0             # no DC part imposed
 init = 1           # initialize omegas uniformly
 tol = 1e-4
 
-# data_minute = pd.read_csv('河南唐河8447.csv')
-# data_minute = pd.read_csv('河南唐河8456.csv', header=None)
-data_minute = pd.read_csv('河南唐河8482.csv')
+data_minute = ###input data###
 
-speed_site = 9
-
-
-num = len(data_minute.iloc[:, 0])
 hour_num = 2000
 
-data_minute_list = trans_list(data_minute.iloc[:, speed_site])
-data_minute_list = trans_type(data_minute_list)
+data_minute_list = trans_type(data_minute)
 
 data_hour_med = []
 for i in range(len(data_minute)):
