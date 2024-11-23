@@ -28,11 +28,10 @@ data_minute_list = trans_type(data_minute)
 data_hour_med = []
 for i in range(len(data_minute)):
     if i % 6 == 0:
-        data_hour_med.append(data_minute.iloc[i, speed_site])
+        data_hour_med.append(data_minute[i])
 
 data_hour_list = data_hour_med[:hour_num]
 data_hour_list = trans_type(data_hour_list)
-
 
 vmd_minute, _, _ = VMD(data_minute_list, alpha, tau, K, DC, init, tol)
 vmd_minute = array_to_list(vmd_minute)
